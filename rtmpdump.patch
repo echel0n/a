@@ -1,0 +1,1922 @@
+From 349e868cffe7f2891b2e8e46627f32382afb79fc Mon Sep 17 00:00:00 2001
+From: Steven Penny <svnpenn@gmail.com>
+Date: Tue, 13 Nov 2012 20:38:15 -0600
+Subject: [PATCH 01/17] Handle RTMP redirect
+
+This patch allows RtmpDump to follow RTMP URL redirects. Before this you could
+run rtmpdump --verbose and see the redirect URL
+
+DEBUG: Property: <Name:      redirect, STRING:     rtmp://46.19.140.146:190/vod>
+
+This patch simply automates the following process. Taken from KSV patch file
+http://github.com/downloads/K-S-V/Scripts/rtmpdump-2.4.zip
+Tested on
+http://datastreaming.altervista.org/LA7.html
+---
+ librtmp/rtmp.c | 60 ++++++++++++++++++++++++++++++++++++++++++++++++++--------
+ librtmp/rtmp.h |  1 +
+ 2 files changed, 53 insertions(+), 8 deletions(-)
+
+diff --git a/librtmp/rtmp.c b/librtmp/rtmp.c
+index 9c32bac..46dffe0 100644
+--- a/librtmp/rtmp.c
++++ b/librtmp/rtmp.c
+@@ -3044,6 +3044,7 @@ HandleInvoke(RTMP *r, const char *body, unsigned int nBodySize)
+     }
+   else if (AVMATCH(&method, &av__error))
+     {
++      int handled = FALSE;
+ #ifdef CRYPTO
+       AVal methodInvoked = {0};
+       int i;
+@@ -3081,20 +3082,63 @@ HandleInvoke(RTMP *r, const char *body, unsigned int nBodySize)
+               /* if PublisherAuth returns 1, then reconnect */
+               PublisherAuth(r, &description);
+             }
+-        }
+-      else
+-        {
+-          RTMP_Log(RTMP_LOGERROR, "rtmp server sent error");
++          handled = TRUE;
+         }
+       free(methodInvoked.av_val);
+-#else
+-      RTMP_Log(RTMP_LOGERROR, "rtmp server sent error");
+ #endif
++      double code = 0;
++      unsigned int parsedPort;
++      AMFObject obj2;
++      AMFObjectProperty p;
++      AVal redirect;
++      SAVC(ex);
++      SAVC(redirect);
++
++      AMFProp_GetObject(AMF_GetProp(&obj, NULL, 3), &obj2);
++      if (RTMP_FindFirstMatchingProperty(&obj2, &av_ex, &p))
++        {
++          AMFProp_GetObject(&p, &obj2);
++          if (RTMP_FindFirstMatchingProperty(&obj2, &av_code, &p))
++            code = AMFProp_GetNumber(&p);
++          if (code == 302 && RTMP_FindFirstMatchingProperty(&obj2, &av_redirect, &p))
++            {
++              AMFProp_GetString(&p, &redirect);
++              r->Link.redirected = TRUE;
++
++              char *url = malloc(redirect.av_len + sizeof ("/playpath"));
++              strncpy(url, redirect.av_val, redirect.av_len);
++              url[redirect.av_len] = '\0';
++              r->Link.tcUrl.av_val = url;
++              r->Link.tcUrl.av_len = redirect.av_len;
++              strcat(url, "//playpath");
++              RTMP_ParseURL(url, &r->Link.protocol, &r->Link.hostname, &parsedPort, &r->Link.playpath0, &r->Link.app);
++              if (parsedPort)
++                r->Link.port = parsedPort;
++            }
++        }
++      if (r->Link.redirected)
++        {
++          handled = TRUE;
++          RTMP_Log(RTMP_LOGINFO, "rtmp server sent redirect");
++        }
++
++      if (!handled)
++        RTMP_Log(RTMP_LOGERROR, "rtmp server sent error");
+     }
+   else if (AVMATCH(&method, &av_close))
+     {
+-      RTMP_Log(RTMP_LOGERROR, "rtmp server requested close");
+-      RTMP_Close(r);
++      if (r->Link.redirected)
++        {
++          r->Link.redirected = FALSE;
++          RTMP_Close(r);
++          RTMP_Log(RTMP_LOGINFO, "trying to connect with redirected url");
++          RTMP_Connect(r, NULL);
++        }
++      else
++        {
++          RTMP_Log(RTMP_LOGERROR, "rtmp server requested close");
++          RTMP_Close(r);
++        }
+ #ifdef CRYPTO
+       if ((r->Link.protocol & RTMP_FEATURE_WRITE) &&
+               !(r->Link.pFlags & RTMP_PUB_CLEAN) &&
+diff --git a/librtmp/rtmp.h b/librtmp/rtmp.h
+index d723070..ad4b65d 100644
+--- a/librtmp/rtmp.h
++++ b/librtmp/rtmp.h
+@@ -176,6 +176,7 @@ extern "C"
+     int swfAge;
+ 
+     int protocol;
++    int redirected;
+     int timeout;		/* connection timeout in seconds */
+ 
+ #define RTMP_PUB_NAME   0x0001  /* send login to server */
+-- 
+1.8.3.4
+
+
+From 373febeb46c9a7fbeaba0ddb1a77389cf8c8ea82 Mon Sep 17 00:00:00 2001
+From: Steven Penny <svnpenn@gmail.com>
+Date: Mon, 17 Sep 2012 00:47:21 -0500
+Subject: [PATCH 02/17] Check bandwidth response
+
+With RtmpSrv, some servers will cause RtmpSrv to stop at this step
+
+  WARNING: Trying different position for client digest!
+
+With these servers the bandwidth needs to be checked from client to server.
+
+Taken from KSV patch file
+http://github.com/downloads/K-S-V/Scripts/rtmpdump-2.4.zip
+Tested with
+http://kanalia.eu/player.php?id=91
+Related link
+http://wowza.com/forums/content.php?252
+---
+ rtmpsrv.c | 50 ++++++++++++++++++++++++++++++++++++++++++++++++++
+ 1 file changed, 50 insertions(+)
+
+diff --git a/rtmpsrv.c b/rtmpsrv.c
+index a9e9045..8a27953 100644
+--- a/rtmpsrv.c
++++ b/rtmpsrv.c
+@@ -97,6 +97,7 @@ void *sslCtx = NULL;
+ STREAMING_SERVER *startStreaming(const char *address, int port);
+ void stopStreaming(STREAMING_SERVER * server);
+ void AVreplace(AVal *src, const AVal *orig, const AVal *repl);
++int SendCheckBWResponse(RTMP *r, int oldMethodType, int onBWDoneInit);
+ 
+ static const AVal av_dquote = AVC("\"");
+ static const AVal av_escdquote = AVC("\\\"");
+@@ -168,6 +169,10 @@ SAVC(level);
+ SAVC(code);
+ SAVC(description);
+ SAVC(secureToken);
++SAVC(_checkbw);
++SAVC(_onbwdone);
++SAVC(checkBandwidth);
++SAVC(onBWDone);
+ 
+ static int
+ SendConnectResult(RTMP *r, double txn)
+@@ -329,6 +334,50 @@ SendPlayStop(RTMP *r)
+   return RTMP_SendPacket(r, &packet, FALSE);
+ }
+ 
++int
++SendCheckBWResponse(RTMP *r, int oldMethodType, int onBWDoneInit)
++{
++  RTMPPacket packet;
++  char pbuf[256], *pend = pbuf + sizeof (pbuf);
++  char *enc;
++
++  packet.m_nChannel = 0x03; /* control channel (invoke) */
++  packet.m_headerType = RTMP_PACKET_SIZE_MEDIUM;
++  packet.m_packetType = RTMP_PACKET_TYPE_INVOKE;
++  packet.m_nTimeStamp = 0;
++  packet.m_nInfoField2 = 0;
++  packet.m_hasAbsTimestamp = 0;
++  packet.m_body = pbuf + RTMP_MAX_HEADER_SIZE;
++
++  enc = packet.m_body;
++  if (oldMethodType)
++    {
++      enc = AMF_EncodeString(enc, pend, &av__onbwdone);
++      enc = AMF_EncodeNumber(enc, pend, 0);
++      *enc++ = AMF_NULL;
++      enc = AMF_EncodeNumber(enc, pend, 10240);
++      enc = AMF_EncodeNumber(enc, pend, 10240);
++    }
++  else
++    {
++      enc = AMF_EncodeString(enc, pend, &av_onBWDone);
++      enc = AMF_EncodeNumber(enc, pend, 0);
++      *enc++ = AMF_NULL;
++      if (!onBWDoneInit)
++        {
++          enc = AMF_EncodeNumber(enc, pend, 10240);
++          enc = AMF_EncodeNumber(enc, pend, 10240);
++          enc = AMF_EncodeNumber(enc, pend, 0);
++          enc = AMF_EncodeNumber(enc, pend, 0);
++        }
++    }
++
++  packet.m_nBodySize = enc - packet.m_body;
++
++  return RTMP_SendPacket(r, &packet, FALSE);
++}
++
++
+ static void
+ spawn_dumper(int argc, AVal *av, char *cmd)
+ {
+@@ -569,6 +618,7 @@ ServeInvoke(STREAMING_SERVER *server, RTMP * r, RTMPPacket *packet, unsigned int
+ 	  server->arglen += countAMF(&r->Link.extras, &server->argc);
+ 	}
+       SendConnectResult(r, txn);
++      SendCheckBWResponse(r, FALSE, TRUE);
+     }
+   else if (AVMATCH(&method, &av_createStream))
+     {
+-- 
+1.8.3.4
+
+
+From 52a6cfaafd4994c83803060518758b51eced3115 Mon Sep 17 00:00:00 2001
+From: Steven Penny <svnpenn@gmail.com>
+Date: Tue, 13 Nov 2012 20:45:42 -0600
+Subject: [PATCH 03/17] ConnectPacket
+
+Some servers were causing RtmpDump to stop at this step
+
+  DEBUG: Invoking connect
+  INFO: Connected...
+  ERROR: RTMP_ReadPacket, failed to read RTMP packet header
+  DEBUG: Closing connection.
+
+Ref
+http://github.com/downloads/K-S-V/Scripts/rtmpdump-2.4.zip
+http://lists.mplayerhq.hu/pipermail/rtmpdump/2011-December/001756.html
+Problem server
+http://tvpublica.com.ar/vivo
+Other tested servers
+http://canaldosconcursos.com.br/video_demo.php?id_cursos=3130
+http://tape.tv
+http://viki.com/channels/5453-killer-k/videos/51483
+http://zonytvcom.info/colorstv.php
+---
+ librtmp/handshake.h | 14 ++++++++++++--
+ librtmp/parseurl.c  | 15 ++++++++++-----
+ librtmp/rtmp.c      | 17 ++++++++++++++++-
+ librtmp/rtmp.h      |  5 +++++
+ 4 files changed, 43 insertions(+), 8 deletions(-)
+
+diff --git a/librtmp/handshake.h b/librtmp/handshake.h
+index 0438486..102ba82 100644
+--- a/librtmp/handshake.h
++++ b/librtmp/handshake.h
+@@ -965,8 +965,18 @@ HandShake(RTMP * r, int FP9HandShake)
+     __FUNCTION__);
+   RTMP_LogHex(RTMP_LOGDEBUG, reply, RTMP_SIG_SIZE);
+ #endif
+-  if (!WriteN(r, (char *)reply, RTMP_SIG_SIZE))
+-    return FALSE;
++  if (r->Link.CombineConnectPacket)
++    {
++      char *HandshakeResponse = malloc(RTMP_SIG_SIZE);
++      memcpy(HandshakeResponse, (char *) reply, RTMP_SIG_SIZE);
++      r->Link.HandshakeResponse.av_val = HandshakeResponse;
++      r->Link.HandshakeResponse.av_len = RTMP_SIG_SIZE;
++    }
++  else
++    {
++      if (!WriteN(r, (char *) reply, RTMP_SIG_SIZE))
++        return FALSE;
++    }
+ 
+   /* 2nd part of handshake */
+   if (ReadN(r, (char *)serversig, RTMP_SIG_SIZE) != RTMP_SIG_SIZE)
+diff --git a/librtmp/parseurl.c b/librtmp/parseurl.c
+index 646c70c..091b03b 100644
+--- a/librtmp/parseurl.c
++++ b/librtmp/parseurl.c
+@@ -140,11 +140,16 @@ parsehost:
+ 	char *slash2, *slash3 = NULL, *slash4 = NULL;
+ 	int applen, appnamelen;
+ 
+-	slash2 = strchr(p, '/');
+-	if(slash2)
+-		slash3 = strchr(slash2+1, '/');
+-	if(slash3)
+-		slash4 = strchr(slash3+1, '/');
++    if ((slash2 = strstr(p, "//")))
++      slash2 += 1;
++    else
++      {
++        slash2 = strchr(p, '/');
++        if (slash2)
++          slash3 = strchr(slash2 + 1, '/');
++        if (slash3)
++          slash4 = strchr(slash3 + 1, '/');
++      }
+ 
+ 	applen = end-p; /* ondemand, pass all parameters as app */
+ 	appnamelen = applen; /* ondemand length */
+diff --git a/librtmp/rtmp.c b/librtmp/rtmp.c
+index 46dffe0..ebdbc07 100644
+--- a/librtmp/rtmp.c
++++ b/librtmp/rtmp.c
+@@ -336,10 +336,12 @@ RTMP_Init(RTMP *r)
+   r->m_nClientBW = 2500000;
+   r->m_nClientBW2 = 2;
+   r->m_nServerBW = 2500000;
+-  r->m_fAudioCodecs = 3191.0;
++  r->m_fAudioCodecs = 3575.0;
+   r->m_fVideoCodecs = 252.0;
+   r->Link.timeout = 30;
+   r->Link.swfAge = 30;
++  r->Link.CombineConnectPacket = TRUE;
++  r->Link.ConnectPacket = FALSE;
+ }
+ 
+ void
+@@ -1512,6 +1514,16 @@ WriteN(RTMP *r, const char *buffer, int n)
+     }
+ #endif
+ 
++  if (r->Link.ConnectPacket)
++    {
++      char *ConnectPacket = malloc(r->Link.HandshakeResponse.av_len + n);
++      memcpy(ConnectPacket, r->Link.HandshakeResponse.av_val, r->Link.HandshakeResponse.av_len);
++      memcpy(ConnectPacket + r->Link.HandshakeResponse.av_len, ptr, n);
++      ptr = ConnectPacket;
++      n += r->Link.HandshakeResponse.av_len;
++      r->Link.ConnectPacket = FALSE;
++    }
++
+   while (n > 0)
+     {
+       int nBytes;
+@@ -1577,6 +1589,9 @@ SendConnectPacket(RTMP *r, RTMPPacket *cp)
+   char pbuf[4096], *pend = pbuf + sizeof(pbuf);
+   char *enc;
+ 
++  if (r->Link.CombineConnectPacket)
++    r->Link.ConnectPacket = TRUE;
++
+   if (cp)
+     return RTMP_SendPacket(r, cp, TRUE);
+ 
+diff --git a/librtmp/rtmp.h b/librtmp/rtmp.h
+index ad4b65d..3e7669e 100644
+--- a/librtmp/rtmp.h
++++ b/librtmp/rtmp.h
+@@ -174,10 +174,15 @@ extern "C"
+     int lFlags;
+ 
+     int swfAge;
++    int swfSize;
+ 
+     int protocol;
++    int ConnectPacket;
++    int CombineConnectPacket;
+     int redirected;
+     int timeout;		/* connection timeout in seconds */
++    AVal Extras;
++    AVal HandshakeResponse;
+ 
+ #define RTMP_PUB_NAME   0x0001  /* send login to server */
+ #define RTMP_PUB_RESP   0x0002  /* send salted password hash */
+-- 
+1.8.3.4
+
+
+From 8f561b2f451be36cda6cb2e3ef8d148831001ff8 Mon Sep 17 00:00:00 2001
+From: Steven Penny <svnpenn@gmail.com>
+Date: Tue, 9 Oct 2012 19:57:43 -0500
+Subject: [PATCH 04/17] StripParams
+
+The querystring for the "-a" parameter was also being used with the "-r"
+parameter. This is not necessary. Cannot use with "-W" as some servers require
+the querystring. Function was moved to librtmp to allow use across the project.
+
+Taken from KSV patch file
+http://github.com/downloads/K-S-V/Scripts/rtmpdump-2.4.zip
+Tested with
+http://history.com/shows/the-universe/videos#the-universe-spaceship-earth
+http://myspace.com/music/player?sid=87831010
+http://teledunet.com
+---
+ librtmp/parseurl.c | 47 +++++++++++++++++++++++++++++++++++++++++++++++
+ librtmp/rtmp.h     |  1 +
+ rtmpsrv.c          |  1 +
+ 3 files changed, 49 insertions(+)
+
+diff --git a/librtmp/parseurl.c b/librtmp/parseurl.c
+index 091b03b..08ee3ab 100644
+--- a/librtmp/parseurl.c
++++ b/librtmp/parseurl.c
+@@ -292,3 +292,50 @@ void RTMP_ParsePlaypath(AVal *in, AVal *out) {
+ 	out->av_val = streamname;
+ 	out->av_len = destptr - streamname;
+ }
++
++AVal
++StripParams(AVal *src)
++{
++  AVal str;
++  if (src->av_val)
++    {
++      str.av_val = calloc(src->av_len + 1, sizeof (char));
++      strncpy(str.av_val, src->av_val, src->av_len);
++      str.av_len = src->av_len;
++      char *start = str.av_val;
++      char *end = start + str.av_len;
++      char *ptr = start;
++
++      while (ptr < end)
++        {
++          if (*ptr == '?')
++            {
++              str.av_len = ptr - start;
++              break;
++            }
++          ptr++;
++        }
++      memset(start + str.av_len, 0, 1);
++
++      char *dynamic = strstr(start, "[[DYNAMIC]]");
++      if (dynamic)
++        {
++          dynamic -= 1;
++          memset(dynamic, 0, 1);
++          str.av_len = dynamic - start;
++          end = start + str.av_len;
++        }
++
++      char *import = strstr(start, "[[IMPORT]]");
++      if (import)
++        {
++          str.av_val = import + 11;
++          strcpy(start, "http://");
++          str.av_val = strcat(start, str.av_val);
++          str.av_len = strlen(str.av_val);
++        }
++      return str;
++    }
++  str = *src;
++  return str;
++}
+diff --git a/librtmp/rtmp.h b/librtmp/rtmp.h
+index 3e7669e..68460ef 100644
+--- a/librtmp/rtmp.h
++++ b/librtmp/rtmp.h
+@@ -296,6 +296,7 @@ extern "C"
+ 		     unsigned int *port, AVal *playpath, AVal *app);
+ 
+   void RTMP_ParsePlaypath(AVal *in, AVal *out);
++  AVal StripParams(AVal *src);
+   void RTMP_SetBufferMS(RTMP *r, int size);
+   void RTMP_UpdateBufferMS(RTMP *r);
+ 
+diff --git a/rtmpsrv.c b/rtmpsrv.c
+index 8a27953..22547fa 100644
+--- a/rtmpsrv.c
++++ b/rtmpsrv.c
+@@ -667,6 +667,7 @@ ServeInvoke(STREAMING_SERVER *server, RTMP * r, RTMPPacket *packet, unsigned int
+ 	  argv[argc].av_val = ptr + 1;
+ 	  argv[argc++].av_len = 2;
+ 	  argv[argc].av_val = ptr + 5;
++	  r->Link.tcUrl = StripParams(&r->Link.tcUrl);
+ 	  ptr += sprintf(ptr," -r \"%s\"", r->Link.tcUrl.av_val);
+ 	  argv[argc++].av_len = r->Link.tcUrl.av_len;
+ 
+-- 
+1.8.3.4
+
+
+From afc7dc25b2b870c390056f05f07af2e37ca1e9ee Mon Sep 17 00:00:00 2001
+From: Steven Penny <svnpenn@gmail.com>
+Date: Tue, 13 Nov 2012 20:51:16 -0600
+Subject: [PATCH 05/17] RtmpSrv command line options
+
+-c, --cert cert
+-h, --help
+-i, --printonly
+-k, --key key
+-p, --port port
+-v, --version
+-z, --debug
+
+I chose to reuse the internal global variable "RTMP_ctrlC" for "--printonly" to
+avoid rewriting several function calls.
+---
+ rtmpsrv.c | 77 ++++++++++++++++++++++++++++++++++++++++++++++++++++++---------
+ 1 file changed, 66 insertions(+), 11 deletions(-)
+
+diff --git a/rtmpsrv.c b/rtmpsrv.c
+index 22547fa..39b0255 100644
+--- a/rtmpsrv.c
++++ b/rtmpsrv.c
+@@ -786,6 +786,12 @@ ServeInvoke(STREAMING_SERVER *server, RTMP * r, RTMPPacket *packet, unsigned int
+ 	    }
+ 	  else
+ 	    {
++	      if (RTMP_ctrlC)
++	        {
++	          printf("%s\n", cmd);
++	          fflush(stdout);
++	          exit(0);
++	        }
+ 	      printf("\n%s\n\n", cmd);
+ 	      fflush(stdout);
+ 	      server->filetime = now;
+@@ -1114,11 +1120,26 @@ sigIntHandler(int sig)
+   signal(SIGINT, SIG_DFL);
+ }
+ 
++void usage()
++{
++  RTMP_LogPrintf
++    (
++      "This is just a stub for an RTMP server. It doesn't do anything beyond\n"
++      "obtaining the connection parameters from the client.\n\n"
++      "-c, --cert cert         RTMPS cert\n"
++      "-h, --help              Prints this help screen.\n"
++      "-i, --printonly         Print RtmpDump command and exit\n"
++      "-k, --key key           RTMPS key\n"
++      "-p, --port port         Overrides the port in the rtmp url\n"
++      "-v, --version           Print version information and exit\n"
++      "-z, --debug             Debug level command output.\n"
++    );
++}
++
+ int
+ main(int argc, char **argv)
+ {
+   int nStatus = RD_SUCCESS;
+-  int i;
+ 
+   // http streaming server
+   char DEFAULT_HTTP_STREAMING_DEVICE[] = "0.0.0.0";	// 0.0.0.0 is any device
+@@ -1127,21 +1148,55 @@ main(int argc, char **argv)
+   int nRtmpStreamingPort = 1935;	// port
+   char *cert = NULL, *key = NULL;
+ 
+-  RTMP_LogPrintf("RTMP Server %s\n", RTMPDUMP_VERSION);
+-  RTMP_LogPrintf("(c) 2010 Andrej Stepanchuk, Howard Chu; license: GPL\n\n");
+-
+   RTMP_debuglevel = RTMP_LOGINFO;
+ 
+-  for (i = 1; i < argc; i++)
++  int opt;
++  struct option longopts[] = {
++    {"cert", 1, NULL, 'c'},
++    {"help", 0, NULL, 'h'},
++    {"printonly", 0, NULL, 'i'},
++    {"key", 1, NULL, 'k'},
++    {"port", 1, NULL, 'p'},
++    {"version", 0, NULL, 'v'},
++    {"debug", 0, NULL, 'z'},
++    {0, 0, 0, 0}
++  };
++
++  while ((opt = getopt_long(argc, argv, "c:hik:p:vz", longopts, NULL)) != -1)
+     {
+-      if (!strcmp(argv[i], "-z"))
+-        RTMP_debuglevel = RTMP_LOGALL;
+-      else if (!strcmp(argv[i], "-c") && i + 1 < argc)
+-        cert = argv[++i];
+-      else if (!strcmp(argv[i], "-k") && i + 1 < argc)
+-        key = argv[++i];
++      switch (opt)
++        {
++          case 'c':
++            cert = optarg;
++            break;
++          case 'h':
++            usage();
++            return RD_SUCCESS;
++          case 'i':
++            RTMP_ctrlC = 1;
++            break;
++          case 'k':
++            key = optarg;
++            break;
++          case 'p':
++            if (atoi(optarg))
++              nRtmpStreamingPort = atoi(optarg);
++            break;
++          case 'v':
++            printf("RTMP Server %s\n", RTMPDUMP_VERSION);
++            return RD_SUCCESS;
++          case 'z':
++            RTMP_debuglevel = RTMP_LOGALL;
++            break;
++          default:
++            usage();
++            return RD_FAILED;
++        }
+     }
+ 
++  RTMP_LogPrintf("RTMP Server %s\n", RTMPDUMP_VERSION);
++  RTMP_LogPrintf("(c) 2010 Andrej Stepanchuk, Howard Chu; license: GPL\n\n");
++
+   if (cert && key)
+     sslCtx = RTMP_TLS_AllocServerContext(cert, key);
+ 
+-- 
+1.8.3.4
+
+
+From 3a80fa801630c9e4959f6998c80b2a412e2f6bc0 Mon Sep 17 00:00:00 2001
+From: Steven Penny <svnpenn@gmail.com>
+Date: Wed, 24 Oct 2012 22:51:18 -0500
+Subject: [PATCH 06/17] Better URL decoding support
+MIME-Version: 1.0
+Content-Type: text/plain; charset=UTF-8
+Content-Transfer-Encoding: 8bit
+
+Currently RtmpDump has limited URL decoding support. If you use Bastien’s patch
+as shown here
+http://lists.mplayerhq.hu/pipermail/rtmpdump/2012-September/002093.html
+You can pass encoded characters like this
+
+  rtmpdump -o a.flv -i "rtmp://server.com/app playpath=foobar\0a"
+
+Where "\0a" will be decoded as a newline.
+
+Also the Playpath can be decoded using an unpatched RtmpDump, as long as it is
+part of the "-r" parameter and properly parsed. Example
+
+  rtmpdump -o a.flv -r rtmp://server.com/app/foobar%0a
+
+Where "%0a" will be decoded as a newline. This presents two problems. One, many
+times RtmpDump is unable to correctly parse the Playpath, mixing it with the
+"app". Two, if you explicitly state the Playpath with "-y", you lose the URL
+decoding support. I have simply moved the URL decoding function that Howard
+wrote to parseurl.c and declared it in rtmp.h, so that it can be used across the
+project. This patch also address concerns here
+http://lists.mplayerhq.hu/pipermail/rtmpdump/2012-October/002112.html
+---
+ librtmp/parseurl.c | 62 ++++++++++++++++++++++++++++++++++++++++++++----------
+ librtmp/rtmp.h     |  1 +
+ rtmpdump.c         |  1 +
+ rtmpgw.c           | 47 -----------------------------------------
+ 4 files changed, 53 insertions(+), 58 deletions(-)
+
+diff --git a/librtmp/parseurl.c b/librtmp/parseurl.c
+index 08ee3ab..91cb7ac 100644
+--- a/librtmp/parseurl.c
++++ b/librtmp/parseurl.c
+@@ -276,21 +276,61 @@ void RTMP_ParsePlaypath(AVal *in, AVal *out) {
+ 			pplen -= 4;
+ 			continue;
+ 		}
+-		if (*p == '%') {
+-			unsigned int c;
+-			sscanf(p+1, "%02x", &c);
+-			*destptr++ = c;
+-			pplen -= 3;
+-			p += 3;
+-		} else {
+-			*destptr++ = *p++;
+-			pplen--;
+-		}
++		*destptr++ = *p++;
++		pplen--;
+ 	}
+ 	*destptr = '\0';
++	http_unescape(streamname);
+ 
+ 	out->av_val = streamname;
+-	out->av_len = destptr - streamname;
++	out->av_len = strlen(streamname);
++}
++
++/* inplace http unescape. This is possible .. strlen(unescaped_string)  <= strlen(esacped_string) */
++void
++http_unescape(char *data)
++{
++  char hex[3];
++  char *stp;
++  int src_x = 0;
++  int dst_x = 0;
++
++  int length = (int) strlen(data);
++  hex[2] = 0;
++
++  while (src_x < length)
++    {
++      if (strncmp(data + src_x, "%", 1) == 0 && src_x + 2 < length)
++	{
++	  //
++	  // Since we encountered a '%' we know this is an escaped character
++	  //
++	  hex[0] = data[src_x + 1];
++	  hex[1] = data[src_x + 2];
++	  data[dst_x] = (char) strtol(hex, &stp, 16);
++	  dst_x += 1;
++	  src_x += 3;
++	}
++      else if (src_x != dst_x)
++	{
++	  //
++	  // This doesn't need to be unescaped. If we didn't unescape anything previously
++	  // there is no need to copy the string either
++	  //
++	  data[dst_x] = data[src_x];
++	  src_x += 1;
++	  dst_x += 1;
++	}
++      else
++	{
++	  //
++	  // This doesn't need to be unescaped, however we need to copy the string
++	  //
++	  src_x += 1;
++	  dst_x += 1;
++	}
++    }
++  data[dst_x] = '\0';
+ }
+ 
+ AVal
+diff --git a/librtmp/rtmp.h b/librtmp/rtmp.h
+index 68460ef..7e4c545 100644
+--- a/librtmp/rtmp.h
++++ b/librtmp/rtmp.h
+@@ -297,6 +297,7 @@ extern "C"
+ 
+   void RTMP_ParsePlaypath(AVal *in, AVal *out);
+   AVal StripParams(AVal *src);
++  void http_unescape(char *data);
+   void RTMP_SetBufferMS(RTMP *r, int size);
+   void RTMP_UpdateBufferMS(RTMP *r);
+ 
+diff --git a/rtmpdump.c b/rtmpdump.c
+index 13741a7..034c135 100644
+--- a/rtmpdump.c
++++ b/rtmpdump.c
+@@ -969,6 +969,7 @@ main(int argc, char **argv)
+ 	    }
+ 	  break;
+ 	case 'y':
++	  http_unescape(optarg);
+ 	  STR2AVAL(playpath, optarg);
+ 	  break;
+ 	case 'Y':
+diff --git a/rtmpgw.c b/rtmpgw.c
+index 3e47602..7a9fd2c 100644
+--- a/rtmpgw.c
++++ b/rtmpgw.c
+@@ -221,53 +221,6 @@ FILE *netstackdump = NULL;
+ FILE *netstackdump_read = NULL;
+ #endif
+ 
+-/* inplace http unescape. This is possible .. strlen(unescaped_string)  <= strlen(esacped_string) */
+-void
+-http_unescape(char *data)
+-{
+-  char hex[3];
+-  char *stp;
+-  int src_x = 0;
+-  int dst_x = 0;
+-
+-  int length = (int) strlen(data);
+-  hex[2] = 0;
+-
+-  while (src_x < length)
+-    {
+-      if (strncmp(data + src_x, "%", 1) == 0 && src_x + 2 < length)
+-	{
+-	  //
+-	  // Since we encountered a '%' we know this is an escaped character
+-	  //
+-	  hex[0] = data[src_x + 1];
+-	  hex[1] = data[src_x + 2];
+-	  data[dst_x] = (char) strtol(hex, &stp, 16);
+-	  dst_x += 1;
+-	  src_x += 3;
+-	}
+-      else if (src_x != dst_x)
+-	{
+-	  //
+-	  // This doesn't need to be unescaped. If we didn't unescape anything previously
+-	  // there is no need to copy the string either
+-	  //
+-	  data[dst_x] = data[src_x];
+-	  src_x += 1;
+-	  dst_x += 1;
+-	}
+-      else
+-	{
+-	  //
+-	  // This doesn't need to be unescaped, however we need to copy the string
+-	  //
+-	  src_x += 1;
+-	  dst_x += 1;
+-	}
+-    }
+-  data[dst_x] = '\0';
+-}
+-
+ TFTYPE
+ controlServerThread(void *unused)
+ {
+-- 
+1.8.3.4
+
+
+From f73d5b300bcefb0499b6469e2088b06620e2a161 Mon Sep 17 00:00:00 2001
+From: Steven Penny <svnpenn@gmail.com>
+Date: Fri, 26 Oct 2012 11:21:06 -0500
+Subject: [PATCH 07/17] RtmpSuck print UsherToken
+
+RtmpSuck already supports streams with UsherToken. This patch merely prints the
+UsherToken if found, for those who might want to invoke RtmpDump.
+
+Taken from KSV patch file
+http://github.com/downloads/K-S-V/Scripts/rtmpdump-2.4.zip
+Tested with
+http://de.twitch.tv
+---
+ rtmpsuck.c | 11 +++++++++++
+ 1 file changed, 11 insertions(+)
+
+diff --git a/rtmpsuck.c b/rtmpsuck.c
+index e886179..b771f6a 100644
+--- a/rtmpsuck.c
++++ b/rtmpsuck.c
+@@ -150,6 +150,7 @@ AVC("NetConnection.Connect.InvalidApp");
+ static const AVal av_NetStream_Play_Start = AVC("NetStream.Play.Start");
+ static const AVal av_NetStream_Play_Complete = AVC("NetStream.Play.Complete");
+ static const AVal av_NetStream_Play_Stop = AVC("NetStream.Play.Stop");
++static const AVal av_NetStream_Authenticate_UsherToken = AVC("NetStream.Authenticate.UsherToken");
+ 
+ static const char *cst[] = { "client", "server" };
+ 
+@@ -303,6 +304,16 @@ ServeInvoke(STREAMING_SERVER *server, int which, RTMPPacket *pack, const char *b
+           return 1;
+         }
+       server->rc.m_bSendCounter = FALSE;
++
++      if (server->rc.Link.extras.o_props)
++        {
++          AMF_Reset(&server->rc.Link.extras);
++        }
++    }
++  else if (AVMATCH(&method, &av_NetStream_Authenticate_UsherToken))
++    {
++      AMFProp_GetString(AMF_GetProp(&obj, NULL, 3), &server->rc.Link.usherToken);
++      RTMP_LogPrintf("%10s : %.*s\n", "usherToken", server->rc.Link.usherToken.av_len, server->rc.Link.usherToken.av_val);
+     }
+   else if (AVMATCH(&method, &av_play))
+     {
+-- 
+1.8.3.4
+
+
+From 819900fbc9590d216cfa75bde28f4f567cb3bc03 Mon Sep 17 00:00:00 2001
+From: Steven Penny <svnpenn@gmail.com>
+Date: Sat, 17 Nov 2012 12:12:20 -0600
+Subject: [PATCH 08/17] Fix rtmpdump.c compiler warning
+
+rtmpdump.c: In function `GetLastKeyframe':
+rtmpdump.c:297:7: warning: unknown conversion type character `l' in format
+rtmpdump.c:297:7: warning: too many arguments for format
+
+http://stackoverflow.com/q/586928/how-should-i-print-types-like-off-t-and-size-t
+---
+ rtmpdump.c | 4 ++--
+ 1 file changed, 2 insertions(+), 2 deletions(-)
+
+diff --git a/rtmpdump.c b/rtmpdump.c
+index 034c135..9dacbf0 100644
+--- a/rtmpdump.c
++++ b/rtmpdump.c
+@@ -293,8 +293,8 @@ GetLastKeyframe(FILE * file,	// output file [in]
+ 
+   bAudioOnly = (dataType & 0x4) && !(dataType & 0x1);
+ 
+-  RTMP_Log(RTMP_LOGDEBUG, "bAudioOnly: %d, size: %llu", bAudioOnly,
+-      (unsigned long long) size);
++  RTMP_Log(RTMP_LOGDEBUG, "bAudioOnly: %d, size: %lu", bAudioOnly,
++      (unsigned long) size);
+ 
+   // ok, we have to get the timestamp of the last keyframe (only keyframes are seekable) / last audio frame (audio only streams)
+ 
+-- 
+1.8.3.4
+
+
+From 9445c163df5c3d8192f2dbb0c0efda4531ddf769 Mon Sep 17 00:00:00 2001
+From: Steven Penny <svnpenn@gmail.com>
+Date: Mon, 19 Nov 2012 11:53:35 -0600
+Subject: [PATCH 09/17] Fix thread.c compiler warning
+
+thread.c: In function `ThreadCreate':
+thread.c:35:11: warning: comparison between pointer and integer
+
+http://stackoverflow.com/q/3905538/testing-for-an-invalid-windows-handle-should
+---
+ thread.c | 2 +-
+ 1 file changed, 1 insertion(+), 1 deletion(-)
+
+diff --git a/thread.c b/thread.c
+index 0913c98..13d624a 100644
+--- a/thread.c
++++ b/thread.c
+@@ -32,7 +32,7 @@ ThreadCreate(thrfunc *routine, void *args)
+   HANDLE thd;
+ 
+   thd = (HANDLE) _beginthread(routine, 0, args);
+-  if (thd == -1L)
++  if (thd == INVALID_HANDLE_VALUE)
+     RTMP_LogPrintf("%s, _beginthread failed with %d\n", __FUNCTION__, errno);
+ 
+   return thd;
+-- 
+1.8.3.4
+
+
+From 5d36b97a7f9c4812f1aa2dabe82c8394ae8a842c Mon Sep 17 00:00:00 2001
+From: Steven Penny <svnpenn@gmail.com>
+Date: Wed, 12 Dec 2012 10:45:19 -0600
+Subject: [PATCH 10/17] Allow AMF_NULL
+MIME-Version: 1.0
+Content-Type: text/plain; charset=UTF-8
+Content-Transfer-Encoding: 8bit
+
+If encountering AMF_NULL, print null instead of INVALID TYPE
+
+Test page
+http://www.slavishow.com/виктор-калев-в-образа-на-силвия-кацаро
+---
+ librtmp/rtmp.c | 1 +
+ 1 file changed, 1 insertion(+)
+
+diff --git a/librtmp/rtmp.c b/librtmp/rtmp.c
+index ebdbc07..5457513 100644
+--- a/librtmp/rtmp.c
++++ b/librtmp/rtmp.c
+@@ -3340,6 +3340,7 @@ DumpMetaData(AMFObject *obj)
+ 		   prop->p_vu.p_number != 0. ? "TRUE" : "FALSE");
+ 	  break;
+ 	case AMF_STRING:
++	case AMF_NULL:
+ 	  len = snprintf(str, 255, "%.*s", prop->p_vu.p_aval.av_len,
+ 		   prop->p_vu.p_aval.av_val);
+ 	  if (len >= 1 && str[len-1] == '\n')
+-- 
+1.8.3.4
+
+
+From c973308305f531adff3f5a981a84698d86019776 Mon Sep 17 00:00:00 2001
+From: Steven Penny <svnpenn@gmail.com>
+Date: Thu, 20 Dec 2012 01:30:23 -0600
+Subject: [PATCH 11/17] RtmpSuck command line options
+
+-h, --help     prints this help screen
+-t, --txt      copy RtmpDump command to rtmpsuck.txt and exit
+-v, --version  print version information and exit
+-z, --debug    debug level command output
+
+I chose to reuse the internal global variable "RTMP_ctrlC" for "--txt" to avoid
+rewriting several function calls.
+---
+ librtmp/parseurl.c | 19 +++++++++++
+ librtmp/rtmp.h     |  1 +
+ rtmpsuck.c         | 94 ++++++++++++++++++++++++++++++++++++++++++++++--------
+ 3 files changed, 101 insertions(+), 13 deletions(-)
+
+diff --git a/librtmp/parseurl.c b/librtmp/parseurl.c
+index 91cb7ac..5f4da43 100644
+--- a/librtmp/parseurl.c
++++ b/librtmp/parseurl.c
+@@ -379,3 +379,22 @@ StripParams(AVal *src)
+   str = *src;
+   return str;
+ }
++
++AVal
++AVcopy(AVal src)
++{
++  AVal dst;
++  if (src.av_len)
++    {
++      dst.av_val = malloc(src.av_len + 1);
++      memcpy(dst.av_val, src.av_val, src.av_len);
++      dst.av_val[src.av_len] = '\0';
++      dst.av_len = src.av_len;
++    }
++  else
++    {
++      dst.av_val = NULL;
++      dst.av_len = 0;
++    }
++  return dst;
++}
+diff --git a/librtmp/rtmp.h b/librtmp/rtmp.h
+index 7e4c545..fc9bf40 100644
+--- a/librtmp/rtmp.h
++++ b/librtmp/rtmp.h
+@@ -297,6 +297,7 @@ extern "C"
+ 
+   void RTMP_ParsePlaypath(AVal *in, AVal *out);
+   AVal StripParams(AVal *src);
++  AVal AVcopy(AVal src);
+   void http_unescape(char *data);
+   void RTMP_SetBufferMS(RTMP *r, int size);
+   void RTMP_UpdateBufferMS(RTMP *r);
+diff --git a/rtmpsuck.c b/rtmpsuck.c
+index b771f6a..994e11d 100644
+--- a/rtmpsuck.c
++++ b/rtmpsuck.c
+@@ -203,12 +203,12 @@ ServeInvoke(STREAMING_SERVER *server, int which, RTMPPacket *pack, const char *b
+             }
+           if (AVMATCH(&pname, &av_app))
+             {
+-              server->rc.Link.app = pval;
++              server->rc.Link.app = AVcopy(pval);
+               pval.av_val = NULL;
+             }
+           else if (AVMATCH(&pname, &av_flashVer))
+             {
+-              server->rc.Link.flashVer = pval;
++              server->rc.Link.flashVer = AVcopy(pval);
+               pval.av_val = NULL;
+             }
+           else if (AVMATCH(&pname, &av_swfUrl))
+@@ -218,7 +218,7 @@ ServeInvoke(STREAMING_SERVER *server, int which, RTMPPacket *pack, const char *b
+ 	        RTMP_HashSWF(pval.av_val, &server->rc.Link.SWFSize,
+ 		  (unsigned char *)server->rc.Link.SWFHash, 30);
+ #endif
+-              server->rc.Link.swfUrl = pval;
++              server->rc.Link.swfUrl = AVcopy(pval);
+               pval.av_val = NULL;
+             }
+           else if (AVMATCH(&pname, &av_tcUrl))
+@@ -226,7 +226,7 @@ ServeInvoke(STREAMING_SERVER *server, int which, RTMPPacket *pack, const char *b
+               char *r1 = NULL, *r2;
+               int len;
+ 
+-              server->rc.Link.tcUrl = pval;
++              server->rc.Link.tcUrl = AVcopy(pval);
+               if ((pval.av_val[0] | 0x40) == 'r' &&
+                   (pval.av_val[1] | 0x40) == 't' &&
+                   (pval.av_val[2] | 0x40) == 'm' &&
+@@ -268,7 +268,7 @@ ServeInvoke(STREAMING_SERVER *server, int which, RTMPPacket *pack, const char *b
+             }
+           else if (AVMATCH(&pname, &av_pageUrl))
+             {
+-              server->rc.Link.pageUrl = pval;
++              server->rc.Link.pageUrl = AVcopy(pval);
+               pval.av_val = NULL;
+             }
+           else if (AVMATCH(&pname, &av_audioCodecs))
+@@ -383,9 +383,35 @@ ServeInvoke(STREAMING_SERVER *server, int which, RTMPPacket *pack, const char *b
+       for (p=file; *p; p++)
+         if (*p == ':')
+           *p = '_';
+-      RTMP_LogPrintf("Playpath: %.*s\nSaving as: %s\n",
+-        server->rc.Link.playpath.av_len, server->rc.Link.playpath.av_val,
+-        file);
++      RTMP_LogPrintf("Playpath: %.*s\n",
++        server->rc.Link.playpath.av_len, server->rc.Link.playpath.av_val);
++
++      if (RTMP_ctrlC)
++  {
++    /* Dump command to file */
++    char *cmd = NULL, *ptr = NULL;
++    AVal tcUrl;
++    cmd = calloc (2048, sizeof (char));
++    ptr = cmd;
++    tcUrl = StripParams (&server->rc.Link.tcUrl);
++    ptr += sprintf(ptr, "rtmpdump -r \"%.*s\" -a \"%.*s\" -f \"%.*s\""
++      " -W \"%.*s\" -p \"%.*s\" -y \"%.*s\" -o a.flv",
++      tcUrl.av_len, tcUrl.av_val,
++      server->rc.Link.app.av_len, server->rc.Link.app.av_val,
++      server->rc.Link.flashVer.av_len, server->rc.Link.flashVer.av_val,
++      server->rc.Link.swfUrl.av_len, server->rc.Link.swfUrl.av_val,
++      server->rc.Link.pageUrl.av_len, server->rc.Link.pageUrl.av_val,
++      server->rc.Link.playpath.av_len, server->rc.Link.playpath.av_val);
++
++    FILE *cmdfile;
++    cmdfile = fopen ("rtmpsuck.txt", "wb");
++    fprintf (cmdfile, "%s\n", cmd);
++    fclose (cmdfile);
++    free (cmd);
++    exit (0);
++  }
++
++      RTMP_LogPrintf("Saving as: %s\n", file);
+       out = fopen(file, "wb");
+       free(file);
+       if (!out)
+@@ -1145,6 +1171,20 @@ sigIntHandler(int sig)
+   signal(SIGINT, SIG_DFL);
+ }
+ 
++void
++usage()
++{
++  RTMP_LogPrintf(
++    "This is a Proxy Server that displays the connection parameters from a\n"
++    "client and then saves any data streamed to the client.\n"
++    "\n"
++    "-h, --help     prints this help screen\n"
++    "-t, --txt      copy RtmpDump command to rtmpsuck.txt and exit\n"
++    "-v, --version  print version information and exit\n"
++    "-z, --debug    debug level command output\n"
++  );
++}
++
+ int
+ main(int argc, char **argv)
+ {
+@@ -1156,13 +1196,41 @@ main(int argc, char **argv)
+   char *rtmpStreamingDevice = DEFAULT_RTMP_STREAMING_DEVICE;	// streaming device, default 0.0.0.0
+   int nRtmpStreamingPort = 1935;	// port
+ 
+-  RTMP_LogPrintf("RTMP Proxy Server %s\n", RTMPDUMP_VERSION);
+-  RTMP_LogPrintf("(c) 2010 Andrej Stepanchuk, Howard Chu; license: GPL\n\n");
+-
+   RTMP_debuglevel = RTMP_LOGINFO;
+ 
+-  if (argc > 1 && !strcmp(argv[1], "-z"))
+-    RTMP_debuglevel = RTMP_LOGALL;
++  struct option longopts[] = {
++    {"help", 0, NULL, 'h'},
++    {"txt", 0, NULL, 't'},
++    {"version", 0, NULL, 'v'},
++    {"debug", 0, NULL, 'z'},
++    {0, 0, 0, 0}
++  };
++
++  int opt;
++  while ((opt = getopt_long(argc, argv, "htvz", longopts, NULL)) != -1)
++    {
++      switch (opt)
++        {
++          case 'h':
++            usage();
++            return RD_SUCCESS;
++          case 't':
++            RTMP_ctrlC = 1;
++            break;
++          case 'v':
++            printf("RTMP Proxy Server %s\n", RTMPDUMP_VERSION);
++            return RD_SUCCESS;
++          case 'z':
++            RTMP_debuglevel = RTMP_LOGALL;
++            break;
++          default:
++            usage();
++            return RD_FAILED;
++        }
++    }
++
++  RTMP_LogPrintf("RTMP Proxy Server %s\n", RTMPDUMP_VERSION);
++  RTMP_LogPrintf("(c) 2010 Andrej Stepanchuk, Howard Chu; license: GPL\n\n");
+ 
+   signal(SIGINT, sigIntHandler);
+ #ifndef WIN32
+-- 
+1.8.3.4
+
+
+From baaa14fc631b95613ef15093ee79d2b4879569e7 Mon Sep 17 00:00:00 2001
+From: Steven Penny <svnpenn@gmail.com>
+Date: Mon, 24 Dec 2012 03:13:21 -0600
+Subject: [PATCH 12/17] RtmpDumpHelper switch
+
+-e, --helper   launch RtmpDumpHelper
+
+Running "rtmpsuck -e" will start RtmpDumpHelper if it is found on the
+PATH.
+---
+ librtmp/parseurl.c | 33 +++++++++++++++++++++++++++++++++
+ librtmp/rtmp.h     |  1 +
+ rtmpsrv.c          | 34 ----------------------------------
+ rtmpsuck.c         |  7 ++++++-
+ 4 files changed, 40 insertions(+), 35 deletions(-)
+
+diff --git a/librtmp/parseurl.c b/librtmp/parseurl.c
+index 5f4da43..31dae48 100644
+--- a/librtmp/parseurl.c
++++ b/librtmp/parseurl.c
+@@ -398,3 +398,36 @@ AVcopy(AVal src)
+     }
+   return dst;
+ }
++
++void
++spawn_dumper(int argc, AVal *av, char *cmd)
++{
++#ifdef WIN32
++  STARTUPINFO si = {0};
++  PROCESS_INFORMATION pi = {0};
++
++  si.cb = sizeof(si);
++  if (CreateProcess(NULL, cmd, NULL, NULL, FALSE, 0, NULL, NULL,
++    &si, &pi))
++    {
++      CloseHandle(pi.hThread);
++      CloseHandle(pi.hProcess);
++    }
++#else
++  /* reap any dead children */
++  while (waitpid(-1, NULL, WNOHANG) > 0);
++
++  if (fork() == 0) {
++    char **argv = malloc((argc+1) * sizeof(char *));
++    int i;
++
++    for (i=0; i<argc; i++) {
++      argv[i] = av[i].av_val;
++      argv[i][av[i].av_len] = '\0';
++    }
++    argv[i] = NULL;
++    if ((i = execvp(argv[0], argv)))
++      _exit(i);
++  }
++#endif
++}
+diff --git a/librtmp/rtmp.h b/librtmp/rtmp.h
+index fc9bf40..4263b3f 100644
+--- a/librtmp/rtmp.h
++++ b/librtmp/rtmp.h
+@@ -298,6 +298,7 @@ extern "C"
+   void RTMP_ParsePlaypath(AVal *in, AVal *out);
+   AVal StripParams(AVal *src);
+   AVal AVcopy(AVal src);
++  void spawn_dumper(int argc, AVal *av, char *cmd);
+   void http_unescape(char *data);
+   void RTMP_SetBufferMS(RTMP *r, int size);
+   void RTMP_UpdateBufferMS(RTMP *r);
+diff --git a/rtmpsrv.c b/rtmpsrv.c
+index 39b0255..b61404a 100644
+--- a/rtmpsrv.c
++++ b/rtmpsrv.c
+@@ -377,40 +377,6 @@ SendCheckBWResponse(RTMP *r, int oldMethodType, int onBWDoneInit)
+   return RTMP_SendPacket(r, &packet, FALSE);
+ }
+ 
+-
+-static void
+-spawn_dumper(int argc, AVal *av, char *cmd)
+-{
+-#ifdef WIN32
+-  STARTUPINFO si = {0};
+-  PROCESS_INFORMATION pi = {0};
+-
+-  si.cb = sizeof(si);
+-  if (CreateProcess(NULL, cmd, NULL, NULL, FALSE, 0, NULL, NULL,
+-    &si, &pi))
+-    {
+-      CloseHandle(pi.hThread);
+-      CloseHandle(pi.hProcess);
+-    }
+-#else
+-  /* reap any dead children */
+-  while (waitpid(-1, NULL, WNOHANG) > 0);
+-
+-  if (fork() == 0) {
+-    char **argv = malloc((argc+1) * sizeof(char *));
+-    int i;
+-
+-    for (i=0; i<argc; i++) {
+-      argv[i] = av[i].av_val;
+-      argv[i][av[i].av_len] = '\0';
+-    }
+-    argv[i] = NULL;
+-    if ((i = execvp(argv[0], argv)))
+-      _exit(i);
+-  }
+-#endif
+-}
+-
+ static int
+ countAMF(AMFObject *obj, int *argc)
+ {
+diff --git a/rtmpsuck.c b/rtmpsuck.c
+index 994e11d..a0e59d2 100644
+--- a/rtmpsuck.c
++++ b/rtmpsuck.c
+@@ -1178,6 +1178,7 @@ usage()
+     "This is a Proxy Server that displays the connection parameters from a\n"
+     "client and then saves any data streamed to the client.\n"
+     "\n"
++    "-e, --helper   launch RtmpDumpHelper\n"
+     "-h, --help     prints this help screen\n"
+     "-t, --txt      copy RtmpDump command to rtmpsuck.txt and exit\n"
+     "-v, --version  print version information and exit\n"
+@@ -1199,6 +1200,7 @@ main(int argc, char **argv)
+   RTMP_debuglevel = RTMP_LOGINFO;
+ 
+   struct option longopts[] = {
++    {"helper", 0, NULL, 'e'},
+     {"help", 0, NULL, 'h'},
+     {"txt", 0, NULL, 't'},
+     {"version", 0, NULL, 'v'},
+@@ -1207,10 +1209,13 @@ main(int argc, char **argv)
+   };
+ 
+   int opt;
+-  while ((opt = getopt_long(argc, argv, "htvz", longopts, NULL)) != -1)
++  while ((opt = getopt_long(argc, argv, "ehtvz", longopts, NULL)) != -1)
+     {
+       switch (opt)
+         {
++          case 'e':
++            spawn_dumper (0, 0, "rtmpdumphelper");
++            break;
+           case 'h':
+             usage();
+             return RD_SUCCESS;
+-- 
+1.8.3.4
+
+
+From cbd8d8ab9c1e2f43a7a0c8ca3e841fb3049657d3 Mon Sep 17 00:00:00 2001
+From: Steven Penny <svnpenn@gmail.com>
+Date: Mon, 24 Dec 2012 16:31:19 -0600
+Subject: [PATCH 13/17] Kill RtmpDumpHelper on close
+
+If RtmpSuck exits or is killed, then kill RtmpDumpHelper as well.
+
+Related
+http://stackoverflow.com/q/53208/how-do-i-automatically-destroy-child-processes
+---
+ librtmp/parseurl.c | 8 ++++++++
+ 1 file changed, 8 insertions(+)
+
+diff --git a/librtmp/parseurl.c b/librtmp/parseurl.c
+index 31dae48..02723a5 100644
+--- a/librtmp/parseurl.c
++++ b/librtmp/parseurl.c
+@@ -403,6 +403,13 @@ void
+ spawn_dumper(int argc, AVal *av, char *cmd)
+ {
+ #ifdef WIN32
++  HANDLE jb = CreateJobObject (NULL, NULL);
++  JOBOBJECT_EXTENDED_LIMIT_INFORMATION jeli;
++
++  jeli.BasicLimitInformation.LimitFlags = JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE;
++  SetInformationJobObject(jb, JobObjectExtendedLimitInformation, &jeli,
++    sizeof(jeli));
++
+   STARTUPINFO si = {0};
+   PROCESS_INFORMATION pi = {0};
+ 
+@@ -410,6 +417,7 @@ spawn_dumper(int argc, AVal *av, char *cmd)
+   if (CreateProcess(NULL, cmd, NULL, NULL, FALSE, 0, NULL, NULL,
+     &si, &pi))
+     {
++      AssignProcessToJobObject (jb, pi.hProcess);
+       CloseHandle(pi.hThread);
+       CloseHandle(pi.hProcess);
+     }
+-- 
+1.8.3.4
+
+
+From bfa06aa96fbff160d4dd487ff704d6b1471deca9 Mon Sep 17 00:00:00 2001
+From: Steven Penny <svnpenn@gmail.com>
+Date: Tue, 1 Jan 2013 21:40:43 -0600
+Subject: [PATCH 14/17] Clean up RtmpDump usage page
+
+fix wrapping of long lines
+add space before each param
+comma instead of pipe character
+short form first
+capitalized some acronyms
+---
+ rtmpdump.c | 170 +++++++++++++++++++++++++++++++++----------------------------
+ 1 file changed, 91 insertions(+), 79 deletions(-)
+
+diff --git a/rtmpdump.c b/rtmpdump.c
+index 9dacbf0..1355aed 100644
+--- a/rtmpdump.c
++++ b/rtmpdump.c
+@@ -638,87 +638,99 @@ Download(RTMP * rtmp,		// connected RTMP object
+ 
+ void usage(char *prog)
+ {
+-	  RTMP_LogPrintf
+-	    ("\n%s: This program dumps the media content streamed over RTMP.\n\n", prog);
+-	  RTMP_LogPrintf("--help|-h               Prints this help screen.\n");
+-	  RTMP_LogPrintf
+-	    ("--url|-i url            URL with options included (e.g. rtmp://host[:port]/path swfUrl=url tcUrl=url)\n");
+-	  RTMP_LogPrintf
+-	    ("--rtmp|-r url           URL (e.g. rtmp://host[:port]/path)\n");
+-	  RTMP_LogPrintf
+-	    ("--host|-n hostname      Overrides the hostname in the rtmp url\n");
+-	  RTMP_LogPrintf
+-	    ("--port|-c port          Overrides the port in the rtmp url\n");
+-	  RTMP_LogPrintf
+-	    ("--socks|-S host:port    Use the specified SOCKS proxy\n");
+-	  RTMP_LogPrintf
+-	    ("--protocol|-l num       Overrides the protocol in the rtmp url (0 - RTMP, 2 - RTMPE)\n");
+-	  RTMP_LogPrintf
+-	    ("--playpath|-y path      Overrides the playpath parsed from rtmp url\n");
+-	  RTMP_LogPrintf
+-	    ("--playlist|-Y           Set playlist before playing\n");
+-	  RTMP_LogPrintf("--swfUrl|-s url         URL to player swf file\n");
+-	  RTMP_LogPrintf
+-	    ("--tcUrl|-t url          URL to played stream (default: \"rtmp://host[:port]/app\")\n");
+-	  RTMP_LogPrintf("--pageUrl|-p url        Web URL of played programme\n");
+-	  RTMP_LogPrintf("--app|-a app            Name of target app on server\n");
++  RTMP_LogPrintf("This program dumps the media content streamed over RTMP.\n");
++  RTMP_LogPrintf("\n");
++  RTMP_LogPrintf(" -h, --help               prints this help screen\n");
++  RTMP_LogPrintf(" -i, --url URL            URL with options included\n");
++  RTMP_LogPrintf
++    ("                          e.g. rtmp://host[:port]/path swfUrl=url tcUrl=url\n");
++  RTMP_LogPrintf
++    (" -r, --rtmp URL           URL (e.g. rtmp://host[:port]/path)\n");
++  RTMP_LogPrintf
++    (" -n, --host hostname      overrides the hostname in the RTMP URL\n");
++  RTMP_LogPrintf
++    (" -c, --port port          overrides the port in the RTMP URL\n");
++  RTMP_LogPrintf(" -S, --socks host:port    use the specified SOCKS proxy\n");
++  RTMP_LogPrintf
++    (" -l, --protocol num       overrides the protocol in the RTMP URL\n");
++  RTMP_LogPrintf("                          0 = RTMP, 2 = RTMPE\n");
++  RTMP_LogPrintf
++    (" -y, --playpath path      overrides the playpath parsed from RTMP URL\n");
++  RTMP_LogPrintf(" -Y, --playlist           set playlist before playing\n");
++  RTMP_LogPrintf(" -s, --swfUrl URL         URL to player SWF file\n");
++  RTMP_LogPrintf(" -t, --tcUrl URL          URL to played stream\n");
++  RTMP_LogPrintf
++    ("                          default: \"rtmp://host[:port]/app\"\n");
++  RTMP_LogPrintf(" -p, --pageUrl URL        web URL of played program\n");
++  RTMP_LogPrintf(" -a, --app app            name of target app on server\n");
+ #ifdef CRYPTO
+-	  RTMP_LogPrintf
+-	    ("--swfhash|-w hexstring  SHA256 hash of the decompressed SWF file (32 bytes)\n");
+-	  RTMP_LogPrintf
+-	    ("--swfsize|-x num        Size of the decompressed SWF file, required for SWFVerification\n");
+-	  RTMP_LogPrintf
+-	    ("--swfVfy|-W url         URL to player swf file, compute hash/size automatically\n");
+-	  RTMP_LogPrintf
+-	    ("--swfAge|-X days        Number of days to use cached SWF hash before refreshing\n");
++  RTMP_LogPrintf
++    (" -w, --swfhash hexstring  SHA256 hash of the decompressed SWF file (32 bytes)\n");
++  RTMP_LogPrintf
++    (" -x, --swfsize num        size of the decompressed SWF file, required for\n");
++  RTMP_LogPrintf("                          SWFVerification\n");
++  RTMP_LogPrintf
++    (" -W, --swfVfy URL         URL to player SWF file, compute hash/size\n");
++  RTMP_LogPrintf("                          automatically\n");
++  RTMP_LogPrintf
++    (" -X, --swfAge days        number of days to use cached SWF hash before\n");
++  RTMP_LogPrintf("                          refreshing\n");
+ #endif
+-	  RTMP_LogPrintf
+-	    ("--auth|-u string        Authentication string to be appended to the connect string\n");
+-	  RTMP_LogPrintf
+-	    ("--conn|-C type:data     Arbitrary AMF data to be appended to the connect string\n");
+-	  RTMP_LogPrintf
+-	    ("                        B:boolean(0|1), S:string, N:number, O:object-flag(0|1),\n");
+-	  RTMP_LogPrintf
+-	    ("                        Z:(null), NB:name:boolean, NS:name:string, NN:name:number\n");
+-	  RTMP_LogPrintf
+-	    ("--flashVer|-f string    Flash version string (default: \"%s\")\n",
+-	     RTMP_DefaultFlashVer.av_val);
+-	  RTMP_LogPrintf
+-	    ("--live|-v               Save a live stream, no --resume (seeking) of live streams possible\n");
+-	  RTMP_LogPrintf
+-	    ("--subscribe|-d string   Stream name to subscribe to (otherwise defaults to playpath if live is specifed)\n");
+-	  RTMP_LogPrintf
+-	    ("--realtime|-R           Don't attempt to speed up download via the Pause/Unpause BUFX hack\n");
+-	  RTMP_LogPrintf
+-	    ("--flv|-o string         FLV output file name, if the file name is - print stream to stdout\n");
+-	  RTMP_LogPrintf
+-	    ("--resume|-e             Resume a partial RTMP download\n");
+-	  RTMP_LogPrintf
+-	    ("--timeout|-m num        Timeout connection num seconds (default: %u)\n",
+-	     DEF_TIMEOUT);
+-	  RTMP_LogPrintf
+-	    ("--start|-A num          Start at num seconds into stream (not valid when using --live)\n");
+-	  RTMP_LogPrintf
+-	    ("--stop|-B num           Stop at num seconds into stream\n");
+-	  RTMP_LogPrintf
+-	    ("--token|-T key          Key for SecureToken response\n");
+-	  RTMP_LogPrintf
+-	    ("--jtv|-j JSON           Authentication token for Justin.tv legacy servers\n");
+-	  RTMP_LogPrintf
+-	    ("--hashes|-#             Display progress with hashes, not with the byte counter\n");
+-	  RTMP_LogPrintf
+-	    ("--buffer|-b             Buffer time in milliseconds (default: %u)\n",
+-	     DEF_BUFTIME);
+-	  RTMP_LogPrintf
+-	    ("--skip|-k num           Skip num keyframes when looking for last keyframe to resume from. Useful if resume fails (default: %d)\n\n",
+-	     DEF_SKIPFRM);
+-	  RTMP_LogPrintf
+-	    ("--quiet|-q              Suppresses all command output.\n");
+-	  RTMP_LogPrintf("--verbose|-V            Verbose command output.\n");
+-	  RTMP_LogPrintf("--debug|-z              Debug level command output.\n");
+-	  RTMP_LogPrintf
+-	    ("If you don't pass parameters for swfUrl, pageUrl, or auth these properties will not be included in the connect ");
+-	  RTMP_LogPrintf("packet.\n\n");
++  RTMP_LogPrintf
++    (" -u, --auth string        authentication string to be appended to the connect\n");
++  RTMP_LogPrintf("                          string\n");
++  RTMP_LogPrintf
++    (" -C, --conn type:data     arbitrary AMF data to be appended to the connect\n");
++  RTMP_LogPrintf("                          string\n");
++  RTMP_LogPrintf
++    ("                          B:boolean(0|1), S:string, N:number,\n");
++  RTMP_LogPrintf
++    ("                          O:object-flag(0|1), Z:(null), NB:name:boolean,\n");
++  RTMP_LogPrintf("                          NS:name:string, NN:name:number\n");
++  RTMP_LogPrintf(" -f, --flashVer string    Flash version string\n");
++  RTMP_LogPrintf("                          default: \"%s\"\n",
++    RTMP_DefaultFlashVer.av_val);
++  RTMP_LogPrintf
++    (" -v, --live               save a live stream, no --resume (seeking) of live\n");
++  RTMP_LogPrintf("                          streams possible\n");
++  RTMP_LogPrintf
++    (" -d, --subscribe string   stream name to subscribe to (otherwise defaults to\n");
++  RTMP_LogPrintf("                          playpath if live is specifed)\n");
++  RTMP_LogPrintf
++    (" -R, --realtime           do not attempt to speed up download via the\n");
++  RTMP_LogPrintf("                          Pause/Unpause BUFX hack\n");
++  RTMP_LogPrintf
++    (" -o, --flv string         FLV output file name, if the file name is - print\n");
++  RTMP_LogPrintf("                          stream to stdout\n");
++  RTMP_LogPrintf(" -e, --resume             resume a partial RTMP download\n");
++  RTMP_LogPrintf
++    (" -m, --timeout num        timeout connection num seconds (default: %u)\n",
++    DEF_TIMEOUT);
++  RTMP_LogPrintf
++    (" -A, --start num          start at num seconds into stream (not valid when\n");
++  RTMP_LogPrintf("                          using --live)\n");
++  RTMP_LogPrintf(" -B, --stop num           stop at num seconds into stream\n");
++  RTMP_LogPrintf(" -T, --token key          key for SecureToken response\n");
++  RTMP_LogPrintf
++    (" -j, --jtv JSON           authentication token for Justin.tv legacy servers\n");
++  RTMP_LogPrintf
++    (" -#, --hashes             display progress with hashes, not with the byte\n");
++  RTMP_LogPrintf("                          counter\n");
++  RTMP_LogPrintf
++    (" -b, --buffer             buffer time in milliseconds (default: %u)\n",
++    DEF_BUFTIME);
++  RTMP_LogPrintf
++    (" -k, --skip num           skip num keyframes when looking for last keyframe to\n");
++  RTMP_LogPrintf
++    ("                          resume from. Useful if resume fails (default: %d)\n",
++    DEF_SKIPFRM);
++  RTMP_LogPrintf(" -q, --quiet              suppresses all command output\n");
++  RTMP_LogPrintf(" -V, --verbose            verbose command output\n");
++  RTMP_LogPrintf(" -z, --debug              debug level command output\n");
++  RTMP_LogPrintf("\n");
++  RTMP_LogPrintf
++    ("If you do not pass parameters for swfUrl, pageUrl, or auth these properties\n");
++  RTMP_LogPrintf("will not be included in the connect packet.\n");
+ }
+ 
+ int
+-- 
+1.8.3.4
+
+
+From f4672e8277e5709a556b99174057883652a6c288 Mon Sep 17 00:00:00 2001
+From: Steven Penny <svnpenn@gmail.com>
+Date: Wed, 2 Jan 2013 13:16:26 -0600
+Subject: [PATCH 15/17] SendInvoke
+
+Some servers were stopping after about 500 kB downloaded.
+
+  Connecting ...
+  WARNING: HandShake: client signature does not match!
+  INFO: Connected...
+  Starting download at: 0.000 kB
+  INFO: Metadata:
+  INFO:   height                480.00
+  INFO:   width                 640.00
+  571.996 kB / 7.12 sec
+  ERROR: RTMP_ReadPacket, failed to read RTMP packet header
+  574.196 kB / 7.28 sec
+  Download complete
+
+Ref
+http://github.com/downloads/K-S-V/Scripts/rtmpdump-2.4.zip
+Problem server
+http://www.cybc.com.cy/index.php/tv?id=90
+---
+ librtmp/rtmp.c     | 122 ++++++++++++++++++++++++++++++++++++++++++++++++++++-
+ librtmp/rtmp_sys.h |   1 +
+ 2 files changed, 122 insertions(+), 1 deletion(-)
+
+diff --git a/librtmp/rtmp.c b/librtmp/rtmp.c
+index 5457513..911fd4c 100644
+--- a/librtmp/rtmp.c
++++ b/librtmp/rtmp.c
+@@ -120,6 +120,8 @@ static int SendFCSubscribe(RTMP *r, AVal *subscribepath);
+ static int SendPlay(RTMP *r);
+ static int SendBytesReceived(RTMP *r);
+ static int SendUsherToken(RTMP *r, AVal *usherToken);
++static int SendInvoke(RTMP *r, AVal *Command, int queue);
++static int strsplit(char *src, int srclen, char delim, char ***params);
+ 
+ #if 0				/* unused */
+ static int SendBGHasStream(RTMP *r, double dId, AVal *playpath);
+@@ -2918,6 +2920,8 @@ AVC("NetStream.Play.UnpublishNotify");
+ static const AVal av_NetStream_Publish_Start = AVC("NetStream.Publish.Start");
+ static const AVal av_NetConnection_Connect_Rejected =
+ AVC("NetConnection.Connect.Rejected");
++static const AVal av_NetConnection_confStream =
++AVC("NetConnection.confStream");
+ 
+ /* Returns 0 for OK/Failed/error, 1 for 'Stop or Complete' */
+ static int
+@@ -2927,6 +2931,9 @@ HandleInvoke(RTMP *r, const char *body, unsigned int nBodySize)
+   AVal method;
+   double txn;
+   int ret = 0, nRes;
++  char pbuf[256], *pend = pbuf + sizeof (pbuf), *enc, **params = NULL;
++  int param_count;
++  AVal av_Command;
+   if (body[0] != 0x02)		/* make sure it is a string method name we start with */
+     {
+       RTMP_Log(RTMP_LOGWARNING, "%s, Sanity failed. no string method in invoke packet",
+@@ -3174,10 +3181,11 @@ HandleInvoke(RTMP *r, const char *body, unsigned int nBodySize)
+   else if (AVMATCH(&method, &av_onStatus))
+     {
+       AMFObject obj2;
+-      AVal code, level;
++      AVal code, level, description;
+       AMFProp_GetObject(AMF_GetProp(&obj, NULL, 3), &obj2);
+       AMFProp_GetString(AMF_GetProp(&obj2, &av_code, -1), &code);
+       AMFProp_GetString(AMF_GetProp(&obj2, &av_level, -1), &level);
++      AMFProp_GetString(AMF_GetProp(&obj2, &av_description, -1), &description);
+ 
+       RTMP_Log(RTMP_LOGDEBUG, "%s, onStatus: %s", __FUNCTION__, code.av_val);
+       if (AVMATCH(&code, &av_NetStream_Failed)
+@@ -3241,6 +3249,48 @@ HandleInvoke(RTMP *r, const char *body, unsigned int nBodySize)
+ 	    r->m_pausing = 3;
+ 	  }
+ 	}
++
++      else if (AVMATCH(&code, &av_NetConnection_confStream))
++  {
++#ifdef CRYPTO
++    static const char hexdig[] = "0123456789abcdef";
++    AVal auth;
++    SAVC(cf_stream);
++    int i;
++    char hash_hex[33] = {0};
++    unsigned char hash[16];
++
++    param_count = strsplit(description.av_val, description.av_len, ':',
++      &params);
++    if (param_count >= 3)
++      {
++        char *buf = malloc(strlen(params[0]) + r->Link.playpath.av_len + 1);
++        strcpy(buf, params[0]);
++        strncat(buf, r->Link.playpath.av_val, r->Link.playpath.av_len);
++        md5_hash((unsigned char *) buf, strlen(buf), hash);
++        for (i = 0; i < 16; i++)
++          {
++            hash_hex[i * 2] = hexdig[0x0f & (hash[i] >> 4)];
++            hash_hex[i * 2 + 1] = hexdig[0x0f & (hash[i])];
++          }
++        auth.av_val = &hash_hex[atoi(params[1]) - 1];
++        auth.av_len = atoi(params[2]);
++        RTMP_Log(RTMP_LOGDEBUG, "Khalsa: %.*s", auth.av_len, auth.av_val);
++
++        enc = pbuf;
++        enc = AMF_EncodeString(enc, pend, &av_cf_stream);
++        enc = AMF_EncodeNumber(enc, pend, txn);
++        *enc++ = AMF_NULL;
++        enc = AMF_EncodeString(enc, pend, &auth);
++        av_Command.av_val = pbuf;
++        av_Command.av_len = enc - pbuf;
++
++        SendInvoke(r, &av_Command, FALSE);
++        free(buf);
++      }
++#endif
++  }
++
+     }
+   else if (AVMATCH(&method, &av_playlist_ready))
+     {
+@@ -5226,3 +5276,73 @@ RTMP_Write(RTMP *r, const char *buf, int size)
+     }
+   return size+s2;
+ }
++
++static int
++SendInvoke(RTMP *r, AVal *Command, int queue)
++{
++  RTMPPacket packet;
++  char pbuf[512], *enc;
++
++  packet.m_nChannel = 0x03; /* control channel (invoke) */
++  packet.m_headerType = RTMP_PACKET_SIZE_MEDIUM;
++  packet.m_packetType = RTMP_PACKET_TYPE_INVOKE;
++  packet.m_nTimeStamp = 0;
++  packet.m_nInfoField2 = 0;
++  packet.m_hasAbsTimestamp = 0;
++  packet.m_body = pbuf + RTMP_MAX_HEADER_SIZE;
++
++  enc = packet.m_body;
++  if (Command->av_len)
++    {
++      memcpy(enc, Command->av_val, Command->av_len);
++      enc += Command->av_len;
++    }
++  else
++    return FALSE;
++  packet.m_nBodySize = enc - packet.m_body;
++
++  return RTMP_SendPacket(r, &packet, queue);
++}
++
++static int
++strsplit(char *src, int srclen, char delim, char ***params)
++{
++  char *sptr, *srcbeg, *srcend, *dstr;
++  int count = 1, i = 0, len = 0;
++
++  if (src == NULL)
++    return 0;
++  if (!srclen)
++    srclen = strlen(src);
++  srcbeg = src;
++  srcend = srcbeg + srclen;
++  sptr = srcbeg;
++
++  /* count the delimiters */
++  while (sptr < srcend)
++    {
++      if (*sptr++ == delim)
++        count++;
++    }
++  sptr = srcbeg;
++  *params = calloc(count, sizeof (size_t));
++  char **param = *params;
++
++  for (i = 0; i < (count - 1); i++)
++    {
++      dstr = strchr(sptr, delim);
++      len = dstr - sptr;
++      param[i] = calloc(len + 1, sizeof (char));
++      strncpy(param[i], sptr, len);
++      sptr += len + 1;
++    }
++
++  /* copy the last string */
++  if (sptr <= srcend)
++    {
++      len = srclen - (sptr - srcbeg);
++      param[i] = calloc(len + 1, sizeof (char));
++      strncpy(param[i], sptr, len);
++    }
++  return count;
++}
+diff --git a/librtmp/rtmp_sys.h b/librtmp/rtmp_sys.h
+index 85d7e53..e16e764 100644
+--- a/librtmp/rtmp_sys.h
++++ b/librtmp/rtmp_sys.h
+@@ -105,6 +105,7 @@ typedef struct tls_server_ctx {
+ #define TLS_write(s,b,l)	ssl_write(s,(unsigned char *)b,l)
+ #define TLS_shutdown(s)	ssl_close_notify(s)
+ #define TLS_close(s)	ssl_free(s); free(s)
++#define md5_hash(i, ilen, o) md5(i, ilen, o)
+ 
+ #elif defined(USE_GNUTLS)
+ #include <gnutls/gnutls.h>
+-- 
+1.8.3.4
+
+
+From dd57cd016c38ac32514a5c84e856af4f8c69560c Mon Sep 17 00:00:00 2001
+From: Steven Penny <svnpenn@gmail.com>
+Date: Wed, 2 Jan 2013 17:39:29 -0600
+Subject: [PATCH 16/17] verifyClient
+
+Some servers were stopping after about 2 MB downloaded.
+
+  Connecting ...
+  INFO: Connected...
+  Starting download at: 0.000 kB
+  INFO: Metadata:
+  INFO:   width                 768.00
+  INFO:   height                572.00
+  INFO:   fps                   25.00
+  1636.427 kB / 7.44 sec
+  ERROR: RTMP_ReadPacket, failed to read RTMP packet body. len: 7597
+  1671.344 kB / 7.68 sec
+  Download complete
+
+Running with debug shows server invoking verifyClient
+
+  DEBUG: RTMP_ClientPacket, received: invoke 34 bytes
+  DEBUG: (object begin)
+  DEBUG: Property: <Name:           no-name., STRING:     verifyClient>
+  DEBUG: Property: <Name:           no-name., NUMBER:     120781448.00>
+  DEBUG: Property: NULL
+  DEBUG: Property: <Name:           no-name., NUMBER:     38.54>
+  DEBUG: (object end)
+  DEBUG: HandleInvoke, server invoking <verifyClient>
+
+Ref
+http://github.com/downloads/K-S-V/Scripts/rtmpdump-2.4.zip
+Problem server
+http://kissfm.ro/kisstv
+---
+ librtmp/rtmp.c | 21 ++++++++++++++++++++-
+ 1 file changed, 20 insertions(+), 1 deletion(-)
+
+diff --git a/librtmp/rtmp.c b/librtmp/rtmp.c
+index 911fd4c..3981242 100644
+--- a/librtmp/rtmp.c
++++ b/librtmp/rtmp.c
+@@ -28,6 +28,7 @@
+ #include <string.h>
+ #include <assert.h>
+ #include <time.h>
++#include <math.h>
+ 
+ #include "rtmp_sys.h"
+ #include "log.h"
+@@ -2922,6 +2923,7 @@ static const AVal av_NetConnection_Connect_Rejected =
+ AVC("NetConnection.Connect.Rejected");
+ static const AVal av_NetConnection_confStream =
+ AVC("NetConnection.confStream");
++static const AVal av_verifyClient = AVC("verifyClient");
+ 
+ /* Returns 0 for OK/Failed/error, 1 for 'Stop or Complete' */
+ static int
+@@ -2933,7 +2935,7 @@ HandleInvoke(RTMP *r, const char *body, unsigned int nBodySize)
+   int ret = 0, nRes;
+   char pbuf[256], *pend = pbuf + sizeof (pbuf), *enc, **params = NULL;
+   int param_count;
+-  AVal av_Command;
++  AVal av_Command, av_Response;
+   if (body[0] != 0x02)		/* make sure it is a string method name we start with */
+     {
+       RTMP_Log(RTMP_LOGWARNING, "%s, Sanity failed. no string method in invoke packet",
+@@ -3304,6 +3306,23 @@ HandleInvoke(RTMP *r, const char *body, unsigned int nBodySize)
+ 	    }
+         }
+     }
++  else if (AVMATCH(&method, &av_verifyClient))
++    {
++      double VerificationNumber = AMFProp_GetNumber(AMF_GetProp(&obj, NULL, 3));
++      RTMP_Log(RTMP_LOGDEBUG, "VerificationNumber: %.2f", VerificationNumber);
++
++      enc = pbuf;
++      enc = AMF_EncodeString(enc, pend, &av__result);
++      enc = AMF_EncodeNumber(enc, pend, txn);
++      *enc++ = AMF_NULL;
++      enc = AMF_EncodeNumber(enc, pend, exp(atan(sqrt(VerificationNumber))) + 1);
++      av_Response.av_val = pbuf;
++      av_Response.av_len = enc - pbuf;
++
++      AMF_Decode(&obj, av_Response.av_val, av_Response.av_len, FALSE);
++      AMF_Dump(&obj);
++      SendInvoke(r, &av_Response, FALSE);
++    }
+   else
+     {
+ 
+-- 
+1.8.3.4
+
+
+From e746a9569ae80a44a236fa14de07a297f9f3b6e1 Mon Sep 17 00:00:00 2001
+From: Steven Penny <svnpenn@gmail.com>
+Date: Wed, 15 May 2013 15:41:54 -0500
+Subject: [PATCH 17/17] added support for featve.com changes
+
+coolsport.tv, kiwisportz.tv and nutjob.eu. All you get now is a 7 second dump.
+---
+ librtmp/rtmp.c | 17 ++++++++++++++++-
+ 1 file changed, 16 insertions(+), 1 deletion(-)
+
+diff --git a/librtmp/rtmp.c b/librtmp/rtmp.c
+index 3981242..ab7ca54 100644
+--- a/librtmp/rtmp.c
++++ b/librtmp/rtmp.c
+@@ -2934,6 +2934,8 @@ HandleInvoke(RTMP *r, const char *body, unsigned int nBodySize)
+   double txn;
+   int ret = 0, nRes;
+   char pbuf[256], *pend = pbuf + sizeof (pbuf), *enc, **params = NULL;
++  char *host = r->Link.hostname.av_len ? r->Link.hostname.av_val : "";
++  char *pageUrl = r->Link.pageUrl.av_len ? r->Link.pageUrl.av_val : "";
+   int param_count;
+   AVal av_Command, av_Response;
+   if (body[0] != 0x02)		/* make sure it is a string method name we start with */
+@@ -2997,7 +2999,20 @@ HandleInvoke(RTMP *r, const char *body, unsigned int nBodySize)
+ 	      RTMP_SendServerBW(r);
+ 	      RTMP_SendCtrl(r, 3, 0, 300);
+ 	    }
+-	  RTMP_SendCreateStream(r);
++    if (strstr(host, "featve.com") || strstr(pageUrl, "featve.com"))
++      {
++        AVal av_auth = AVC("yes");
++        SAVC(allowMePlay);
++        enc = pbuf;
++        enc = AMF_EncodeString(enc, pend, &av_allowMePlay);
++        enc = AMF_EncodeNumber(enc, pend, ++r->m_numInvokes);
++        *enc++ = AMF_NULL;
++        enc = AMF_EncodeString(enc, pend, &av_auth);
++        av_Command.av_val = pbuf;
++        av_Command.av_len = enc - pbuf;
++        SendInvoke(r, &av_Command, FALSE);
++      }
++    RTMP_SendCreateStream(r);
+ 
+ 	  if (!(r->Link.protocol & RTMP_FEATURE_WRITE))
+ 	    {
+-- 
+1.8.3.4
+
